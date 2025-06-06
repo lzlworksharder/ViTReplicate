@@ -12,4 +12,5 @@ scikit-learn
 pandas
 numpy
 kaggle
+huggingface_hub
 deepspeed
