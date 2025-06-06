@@ -1,0 +1,15 @@
+torch
+torchvision
+datasets
+accelerate
+torchmetrics
+optuna
+plotly
+tensorboard
+transformers
+kaleido
+scikit-learn
+pandas
+numpy
+kaggle
+deepspeed
