@@ -1,5 +1,6 @@
 torch
 torchvision
+datasets
 accelerate
 torchmetrics
 optuna
@@ -11,5 +12,4 @@ scikit-learn
 pandas
 numpy
 kaggle
-datasets
 deepspeed
