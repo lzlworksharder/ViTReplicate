@@ -6,7 +6,7 @@ from transformers import AutoModelForImageClassification
 from torchvision import transforms
 from torch import nn
 from argparse import ArgumentParser
-import optuna
+# import optuna
 def seed_everything(seed: int):
     import random, os
     import numpy as np
@@ -19,22 +19,43 @@ def seed_everything(seed: int):
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = True
+def create_pytorch_lr_scheduler(optimizer, total_steps, base_lr, decay_type, warmup_steps, linear_end=1e-5):
+    import math
+    import torch.optim.lr_scheduler as lr_scheduler
     
+    def lr_lambda(current_step):
+        # Handle warmup period
+        if current_step < warmup_steps:
+            return current_step / warmup_steps
+        
+        # After warmup, apply decay
+        progress = (current_step - warmup_steps) / (total_steps - warmup_steps)        
+        if decay_type == 'linear':
+            return linear_end / base_lr + (1.0 - linear_end / base_lr) * (1.0 - progress)
+        elif decay_type == 'cosine':
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+        else:
+            raise ValueError(f'Unknown decay type: {decay_type}')
+    return lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
 def main():
     seed_everything(42)
 
 
-    image_size = 384
+    h_res=448
+    l_res=384
     train_trans = transforms.Compose([
-            transforms.Resize((448,448)),
-            transforms.RandomCrop(image_size),
+            transforms.Resize(h_res),
+            transforms.RandomCrop(l_res),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5071, 0.4867, 0.4408], std=[0.2675, 0.2565, 0.2761]),
         ])
 
     test_trans=transforms.Compose([
-            transforms.Resize((image_size, image_size)),
+            transforms.Resize(h_res),
+            transforms.CenterCrop(l_res),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5071, 0.4867, 0.4408], std=[0.2675, 0.2565, 0.2761]),
         ])
@@ -55,25 +76,19 @@ def main():
     debug = args.debug
 
     config = {
-        # "steps": 10000 if not debug else 10,
-        # "eval_step": 50 if not debug else 10,
         "log_step": 5,
-        # train_micro_batch_per_device=32
-        # total_batch_size = micro_per_device*accumu_steps*num_gpus
         'batch_size': 32 if not debug else 4,
-        # 'gradient_accumulation_steps': 2,
         'num_workers': 4 if not debug else 0,
         'data_dir': "./data/cifar100",
         'model_dir':'./pretrained/vit-l-16',
         'freeze_feature_extractor': args.freeze_feature_extractor,
-        # "precision": "fp16",
         'early_stopping': False,
         }
-    import yaml
-    with open('config.yaml', 'r') as f:
-        num_processes = yaml.safe_load(f)['num_processes']
+    # import yaml
+    # with open('config.yaml', 'r') as f:
+    #     num_processes = yaml.safe_load(f)['num_processes']
 
-    config['steps'] = 10000*(512//(config['batch_size']*num_processes)) if not debug else 10
+    config['steps'] = 10000 if not debug else 10
     config['eval_step'] = config['steps'] // 2 if not debug else 1
 
     print("Loading data...")
@@ -91,70 +106,67 @@ def main():
 
 
 
-    def objective(trial):
-        # Define the hyperparameters to tune
-        lr = trial.suggest_categorical("lr", [1e-3, 3e-3, 1e-2,3e-2])
+    # Define the hyperparameters to tune
+    # Base learning rate (the one you pass to optimizer)
+    base_lr = 1e-2
+    weight_decay = 0  # Add weight decay to prevent overfitting
 
-        # Create a fresh model instance for each trial
-        model = AutoModelForImageClassification.from_pretrained(
-            config['model_dir'],
-            num_labels=len(classes),
-            ignore_mismatched_sizes=True,
-            image_size=image_size,
-            # attn_implementation='eager',
-        )
-        # model.gradient_checkpointing_enable()
+    # Create a fresh model instance for each trial
+    model = AutoModelForImageClassification.from_pretrained(
+        config['model_dir'],
+        num_labels=len(classes),
+        ignore_mismatched_sizes=True,
+        image_size=l_res,
+    )
 
-        if config['freeze_feature_extractor']:
-            for name, param in model.named_parameters():
-                if not 'classifier' in name:
-                    param.requires_grad = False
+    if config['freeze_feature_extractor']:
+        for name, param in model.named_parameters():
+            if not 'classifier' in name:
+                param.requires_grad = False
 
-        # Create the optimizer with the suggested hyperparameters
-        optimizer = SGD(model.parameters(), lr=lr, weight_decay=0, momentum=0.9)
+    # Create the optimizer with the suggested hyperparameters
+    optimizer = SGD(model.parameters(), lr=base_lr, weight_decay=weight_decay, momentum=0.9)
 
-        scheduler = lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=config['steps'],
-            eta_min=0,
-        )
+    warmup_steps = 500
+    scheduler = create_pytorch_lr_scheduler(
+        optimizer=optimizer,
+        total_steps=config['steps'],
+        base_lr=base_lr,
+        decay_type='cosine',  # 'cosine' is usually better for transformers
+        warmup_steps=warmup_steps,
+        linear_end=1e-5
+    )
 
-        train_args = {
-            "train_loader": train_loader,
-            "val_loader": val_loader,
-            "model": model,
-            "optimizer": optimizer,
-            "scheduler": scheduler,
-            "steps": config["steps"],
-            "eval_step":config["eval_step"],
-            "log_step": config["log_step"],
-            # "precision": config["precision"],
-            'debug':debug,
-            'early_stopping':config['early_stopping'],
-            'num_classes':len(classes),
-            # 'gradient_accumulation_steps': config['gradient_accumulation_steps'],
-            # 'trial': trial,
-            # 'patience':4,
-            # 'min_delta':0.001,
-        }
-        loop = TrainLoop(**train_args)
-        print("Training loop object initialized")
+    train_args = {
+        "train_loader": train_loader,
+        "val_loader": val_loader,
+        "model": model,
+        "optimizer": optimizer,
+        "scheduler": scheduler,
+        "steps": config["steps"],
+        "eval_step":config["eval_step"],
+        "log_step": config["log_step"],
+        'debug':debug,
+        'early_stopping':config['early_stopping'],
+        'num_classes':len(classes),
+    }
+    loop = TrainLoop(**train_args)
+    print("Training loop object initialized")
 
-        print("Starting training...")
-        loop.run_loop()
-        
-        return loop.acc.compute().item()
-    search_space = {
-    "lr": [1e-3, 3e-3, 1e-2, 3e-2],
+    print("Starting training...")
+    loop.run_loop()
+    
+    # search_space = {
+    # "lr": [1e-3, 3e-3, 1e-2, 3e-2],
     # "batch_size": [16, 32, 64],
     # "momentum": [0.9, 0.95, 0.99],
     # "weight_decay": [0.01, 0.001, 0.0001],
-    }
-    study = optuna.create_study(direction="maximize",
-                                sampler=optuna.samplers.GridSampler(search_space),
-                                )
-    study.optimize(objective)
-    optuna.visualization.plot_optimization_history(study).write_image("optimization_history.png")
+    # }
+    # study = optuna.create_study(direction="maximize",
+    #                             sampler=optuna.samplers.GridSampler(search_space),
+    #                             )
+    # study.optimize(objective)
+    # optuna.visualization.plot_optimization_history(study).write_image("optimization_history.png")
 
 
 if __name__ == "__main__":

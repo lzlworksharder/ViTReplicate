@@ -97,11 +97,8 @@ class TrainLoop:
                     self.accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
                     self.cur_step += 1
                     tbar.update()
-                    self.optimizer.step()
-                    if self.scheduler.scheduler.__class__.__name__ == "ReduceLROnPlateau":
-                        self.scheduler.step(self.acc.compute())
-                    else:
-                        self.scheduler.step()
+                    self.optimizer.step() 
+                    self.scheduler.step()
                     self.optimizer.zero_grad()
             
                     if self.cur_step % self.log_step == 0:
