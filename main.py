@@ -55,22 +55,26 @@ def main():
     debug = args.debug
 
     config = {
-        "steps": 10000 if not debug else 10,
-        "eval_step": 50 if not debug else 10,
+        # "steps": 10000 if not debug else 10,
+        # "eval_step": 50 if not debug else 10,
         "log_step": 5,
         # train_micro_batch_per_device=32
         # total_batch_size = micro_per_device*accumu_steps*num_gpus
         'batch_size': 32 if not debug else 4,
-        'gradient_accumulation_steps': 1,
+        # 'gradient_accumulation_steps': 2,
         'num_workers': 4 if not debug else 0,
         'data_dir': "./data/cifar100",
         'model_dir':'./pretrained/vit-l-16',
         'freeze_feature_extractor': args.freeze_feature_extractor,
-        "precision": "fp16",
+        # "precision": "fp16",
         'early_stopping': False,
         }
-    num_gpus = 8
-    config['steps'] = config['batch_size']*config['gradient_accumulation_steps']*num_gpus if not debug else 10
+    import yaml
+    with open('config.yaml', 'r') as f:
+        num_processes = yaml.safe_load(f)['num_processes']
+
+    config['steps'] = 10000*(512//(config['batch_size']*num_processes)) if not debug else 10
+    config['eval_step'] = config['steps'] // 2 if not debug else 1
 
     print("Loading data...")
     train_loader, val_loader = load_train_val_cifar100(
@@ -124,11 +128,11 @@ def main():
             "steps": config["steps"],
             "eval_step":config["eval_step"],
             "log_step": config["log_step"],
-            "precision": config["precision"],
+            # "precision": config["precision"],
             'debug':debug,
             'early_stopping':config['early_stopping'],
             'num_classes':len(classes),
-            'gradient_accumulation_steps': config['gradient_accumulation_steps'],
+            # 'gradient_accumulation_steps': config['gradient_accumulation_steps'],
             # 'trial': trial,
             # 'patience':4,
             # 'min_delta':0.001,

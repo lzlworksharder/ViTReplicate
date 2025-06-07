@@ -12,8 +12,8 @@ class TrainLoop:
             steps,
             num_classes=100,
             eval_step=None, 
-            gradient_accumulation_steps=1, 
-            precision='bf16', 
+            # gradient_accumulation_steps=1, 
+            # precision='bf16', 
             log_step=100, 
             save_step=None, 
             debug=False,
@@ -24,8 +24,8 @@ class TrainLoop:
             ):  
         # accelerator with multi-GPU support
         self.accelerator = Accelerator(
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            mixed_precision=precision,
+            # gradient_accumulation_steps=gradient_accumulation_steps,
+            # mixed_precision=precision,
             log_with='tensorboard',
             project_dir='./logs',
         )
@@ -37,6 +37,7 @@ class TrainLoop:
         # 初始化指标
         self.acc = Accuracy(task="multiclass", num_classes=num_classes).to(self.accelerator.device)
         self.loss_metric = MeanMetric().to(self.accelerator.device)
+        self.val_acc = Accuracy(task="multiclass", num_classes=num_classes).to(self.accelerator.device)
 
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -77,39 +78,40 @@ class TrainLoop:
 
                 # 用ds+梯度累计时不能写上下文管理器，accumulate的no_sync和zero分片的all reduce冲突！
                 # with self.accelerator.accumulate(self.model):
-                # forward
+
+                # forward + backward
                 output = self.model(**batch) if isinstance(batch, dict) else self.model(*batch)
-                # metrics update
                 loss = output.loss
                 logits = output.logits
-                self.loss_metric.update(loss.item())
                 preds = torch.argmax(logits, dim=-1)
-                self.acc.update(preds, batch['labels'] if isinstance(batch, dict) else batch[1])
-
-                # backward
                 self.accelerator.backward(loss)
-                # clip and step
+
+                # gather results and update metrics
+                all_loss = self.accelerator.gather_for_metrics(loss)
+                all_preds, all_labels = self.accelerator.gather_for_metrics((preds, batch['labels'] if isinstance(batch, dict) else batch[1]))
+                self.acc.update(all_preds, all_labels)
+                self.loss_metric.update(all_loss)
+
+
                 if self.accelerator.sync_gradients:
                     self.accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
                     self.cur_step += 1
                     tbar.update()
-
-                self.optimizer.step()
-                if self.scheduler.scheduler.__class__.__name__ == "ReduceLROnPlateau":
-                    self.scheduler.step(self.acc.compute())
-                else:
-                    self.scheduler.step()
-                self.optimizer.zero_grad()
+                    self.optimizer.step()
+                    if self.scheduler.scheduler.__class__.__name__ == "ReduceLROnPlateau":
+                        self.scheduler.step(self.acc.compute())
+                    else:
+                        self.scheduler.step()
+                    self.optimizer.zero_grad()
             
-                if self.accelerator.sync_gradients:
                     if self.cur_step % self.log_step == 0:
                         # Gather metrics from all processes
-                        train_loss = self.accelerator.gather(self.loss_metric.compute()).mean()
-                        train_acc = self.accelerator.gather(self.acc.compute()).mean()
-                        
+                        train_loss = self.loss_metric.compute().item()
+                        train_acc = self.acc.compute().item()
+
                         metrics = {
-                            "train_loss": train_loss.item(),
-                            "train_acc": train_acc.item(),
+                            "train_loss": train_loss,
+                            "train_acc": train_acc,
                         }
                         
                         if self.accelerator.is_local_main_process:
@@ -124,17 +126,15 @@ class TrainLoop:
                             
                             if self.accelerator.is_local_main_process:
                                 self.accelerator.log(metrics, step=self.cur_step)
-                            
                             # Synchronize validation results across all processes
                             self.accelerator.wait_for_everyone()
-                            
                             if val_acc > (self.best_val_acc + self.min_delta):
                                 self.best_val_acc = val_acc
                                 self.patience_counter = 0
                                 if self.accelerator.is_local_main_process:
                                     save_path = os.path.join(self.save_dir, f"best_model_step_{self.cur_step}")
                                     os.makedirs(self.save_dir, exist_ok=True)
-                                    self.accelerator.save_state(save_path)
+                                    # self.accelerator.save_state(save_path)
                                     self.accelerator.print(f"\nStep {self.cur_step}: New best val_acc: {val_acc:.4f}")
                             else:
                                 if self.accelerator.is_local_main_process:
@@ -165,22 +165,18 @@ class TrainLoop:
             self.accelerator.end_training()
         
     def val(self):
-        self.acc.reset()
-        a = 0
-        for batch in self.val_loader:
+        self.val_acc.reset()
+
+        for i,batch in enumerate(self.val_loader):
             outputs = self.model(**batch)
             preds = torch.argmax(outputs.logits, dim=-1)
-            self.acc.update(preds, batch['labels'])
-            a += 1
-            if self.debug:
-                if a >= 2:
-                    break
+            all_preds,all_labels = self.accelerator.gather_for_metrics((preds, batch['labels'])) 
+            self.val_acc.update(all_preds, all_labels)
 
-        # Gather validation accuracy from all processes
-        current_acc = self.accelerator.gather(self.acc.compute()).mean()
+            if self.debug and i>= 2: break
 
         metrics = {
-            "val_acc": current_acc.item()
+            "val_acc": self.val_acc.compute().item(),
         }
         return metrics
 
